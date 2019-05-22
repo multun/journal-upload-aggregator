@@ -112,8 +112,8 @@ class AsyncWatchdog(ABC):
 
 
 class AsyncBatchWatchdog(AsyncWatchdog):
-    def __init__(self, timeout, treshold, callback):
-        self.treshold = treshold
+    def __init__(self, timeout, batch_size, callback):
+        self.batch_size = batch_size
         self.callback = callback
         self.queue = deque()
         self.last_insertion = 0
@@ -122,7 +122,7 @@ class AsyncBatchWatchdog(AsyncWatchdog):
     async def insert(self, message):
         self.queue.append(message)
         self.last_insertion = perf_counter()
-        if len(self.queue) >= self.treshold:
+        if len(self.queue) >= self.batch_size:
             await self.signal_blocking()
 
     async def push(self):

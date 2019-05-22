@@ -1,6 +1,10 @@
+#!/usr/bin/python3
+
+import sys
 import struct
 
 from aiohttp import web, ClientSession
+from argparse import ArgumentParser
 from async_generator import async_generator, asynccontextmanager, yield_
 from itertools import chain
 from log import setup_logger
@@ -8,6 +12,37 @@ from watchdog import AsyncBatchWatchdog
 
 
 logger = setup_logger(__name__)
+
+
+DEFAULT_HOST = "localhost"
+DEFAULT_PORT = 8080
+DEFAULT_WATCHDOG_TIMEOUT = 2
+DEFAULT_BATCH_SIZE = 500
+
+
+def _argument_parser():
+    parser = ArgumentParser(
+        description="Start a systemd to elasticsearch journal aggregator"
+    )
+
+    parser.add_argument("--host", default=DEFAULT_HOST, help="Hostname to listen to")
+    parser.add_argument(
+        "--watchdog-timeout",
+        default=DEFAULT_WATCHDOG_TIMEOUT,
+        type=float,
+        help="Interval at which a watchdog should check for old incomplete batches",
+    )
+    parser.add_argument(
+        "--batch-size",
+        default=DEFAULT_BATCH_SIZE,
+        type=int,
+        help="How big does a batch needs to be before being sent",
+    )
+    parser.add_argument(
+        "-p", "--port", default=DEFAULT_PORT, type=int, help="Port to listen to"
+    )
+    parser.add_argument("elastic-url", help="Url to send batched logs to")
+    return parser
 
 
 async def parse_field(stream):
@@ -43,9 +78,18 @@ async def parse_stream(stream):
 
 
 class JournalGateway:
-    __slots__ = ("app", "client", "target_endpoint", "watchdog")
+    __slots__ = (
+        "app",
+        "client",
+        "target_endpoint",
+        "watchdog",
+        "timeout",
+        "batch_size",
+    )
 
-    def __init__(self, target_endpoint):
+    def __init__(self, timeout, batch_size, target_endpoint):
+        self.timeout = timeout
+        self.batch_size = batch_size
         self.target_endpoint = target_endpoint
         self.app = web.Application()
         self.app.add_routes(
@@ -72,10 +116,9 @@ class JournalGateway:
 
     @async_generator
     async def watchdog_ctx(self, app):
-        timeout = 2
-        treshold = 600
-        callback = self.send_batch
-        async with AsyncBatchWatchdog.context(timeout, treshold, callback) as wd:
+        async with AsyncBatchWatchdog.context(
+            self.timeout, self.batch_size, self.send_batch
+        ) as wd:
             self.watchdog = wd
             await yield_()
             self.watchdog = None
@@ -88,6 +131,16 @@ class JournalGateway:
         return web.Response(text=f"Inserted {count} log items")
 
 
+def main(args=None):
+    if args is None:
+        args = sys.argv[1:]
+
+    options = _argument_parser().parse_args(args=args)
+    gw = JournalGateway(
+        options.watchdog_timeout, options.batch_size, getattr(options, "elastic-url")
+    )
+    web.run_app(gw.app, host=options.host, port=options.port)
+
+
 if __name__ == "__main__":
-    gw = JournalGateway("")
-    web.run_app(gw.app)
+    main()
