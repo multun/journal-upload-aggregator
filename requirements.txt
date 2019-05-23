@@ -1,0 +1,3 @@
+aiohttp
+async_generator
+backoff
