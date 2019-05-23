@@ -1,7 +1,10 @@
 #!/usr/bin/python3
 
-import sys
+import aiohttp
+import backoff
+import json
 import struct
+import sys
 
 from aiohttp import web, ClientSession
 from argparse import ArgumentParser
@@ -42,6 +45,7 @@ def _argument_parser():
         "-p", "--port", default=DEFAULT_PORT, type=int, help="Port to listen to"
     )
     parser.add_argument("elastic-url", help="Url to send batched logs to")
+    parser.add_argument("index-name", help="Name of the elasticsearch index")
     return parser
 
 
@@ -49,6 +53,8 @@ async def parse_field(stream):
     line = await stream.readline()
     if not line or line == b"\n":
         return None
+
+    line = line[:-1]
 
     field_name, sep, field_value = line.partition(b"=")
     if sep:
@@ -71,6 +77,18 @@ async def parse_entry(stream):
     return fields
 
 
+def message_format(message, index):
+    message_dict = {
+        k.lstrip(b"_").decode("latin1"): int(v) if v.isdigit() else v.decode("latin1")
+        for k, v in message
+    }
+
+    message_id = message_dict.pop("CURSOR")
+    message_ser = json.dumps(message_dict)
+    message_header = json.dumps({"index": {"_index": index, "_id": message_id}})
+    return f"{message_header}\n{message_ser}\n"
+
+
 @async_generator
 async def parse_stream(stream):
     while not stream.at_eof():
@@ -85,9 +103,11 @@ class JournalGateway:
         "watchdog",
         "timeout",
         "batch_size",
+        "index_name",
     )
 
-    def __init__(self, timeout, batch_size, target_endpoint):
+    def __init__(self, timeout, batch_size, target_endpoint, index_name):
+        self.index_name = index_name
         self.timeout = timeout
         self.batch_size = batch_size
         self.target_endpoint = target_endpoint
@@ -111,8 +131,28 @@ class JournalGateway:
             await yield_()
             self.client = None
 
+    # indefinitely retry
+    @backoff.on_exception(backoff.expo, aiohttp.ClientError)
     async def send_batch(self, messages):
-        logger.info("messages: %s", len(messages))
+        if not messages:
+            return
+
+        payload = "".join(
+            message_format(msg, self.index_name) + "\n" for msg in messages
+        )
+        logger.info("sending payload of size: %d", len(payload))
+        headers = {"Content-Type": "application/x-ndjson"}
+        try:
+            async with self.client.post(
+                self.target_endpoint,
+                data=payload.encode("utf-8"),
+                headers=headers,
+                raise_for_status=True,
+            ) as response:
+                pass
+        except aiohttp.ClientError:
+            logger.exception("posting to ES failed")
+            raise
 
     @async_generator
     async def watchdog_ctx(self, app):
@@ -137,7 +177,10 @@ def main(args=None):
 
     options = _argument_parser().parse_args(args=args)
     gw = JournalGateway(
-        options.watchdog_timeout, options.batch_size, getattr(options, "elastic-url")
+        options.watchdog_timeout,
+        options.batch_size,
+        getattr(options, "elastic-url"),
+        getattr(options, "index-name"),
     )
     web.run_app(gw.app, host=options.host, port=options.port)
 
