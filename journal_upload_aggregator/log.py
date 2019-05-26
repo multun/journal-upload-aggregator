@@ -1,6 +1,7 @@
 import sys
 import logging
 
+
 LOG_FORMAT = (
     "%(asctime)s\t"
     "%(process)d\t"
@@ -30,3 +31,37 @@ def setup_logger(name):
     if not root_logger.hasHandlers():
         initialize_logger(root_logger)
     return logging.getLogger(name)
+
+
+LOG_LEVELS = {
+    "CRITICAL": logging.CRITICAL,
+    "ERROR": logging.ERROR,
+    "WARNING": logging.WARNING,
+    "INFO": logging.INFO,
+    "DEBUG": logging.DEBUG,
+    "NOTSET": logging.NOTSET,
+}
+
+
+log_level_order = (
+    logging.CRITICAL,
+    logging.ERROR,
+    logging.WARNING,
+    logging.INFO,
+    logging.DEBUG,
+    logging.NOTSET,
+)
+
+
+def log_level_deduce(verbose_count, quiet_count, default_level=logging.INFO):
+    i = log_level_order.index(default_level)
+    i = min(len(log_level_order) - 1, max(0, i + verbose_count - quiet_count))
+    return log_level_order[i]
+
+
+def LogLevel(str_level):
+    text_level = LOG_LEVELS.get(str_level, None)
+    if text_level is not None:
+        return text_level
+
+    return int(str_level)

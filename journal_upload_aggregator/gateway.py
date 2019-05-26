@@ -1,52 +1,26 @@
-#!/usr/bin/python3
-
+import logging
 import aiohttp
 import backoff
 import json
 import struct
-import sys
+
+from time import perf_counter
 
 from aiohttp import web, ClientSession
-from argparse import ArgumentParser
 from async_generator import async_generator, asynccontextmanager, yield_
-from itertools import chain
-from log import setup_logger
-from watchdog import AsyncBatchWatchdog
 
+from .watchdog import AsyncBatchWatchdog
+from .log import setup_logger
+from .prometheus import prometheus_endpoint
+from .monitoring import (
+    http_journal_receive_time,
+    http_journal_receive_entries_count,
+    journal_send_exceptions,
+    journal_send_rounds,
+    call_counter,
+)
 
 logger = setup_logger(__name__)
-
-
-DEFAULT_HOST = "localhost"
-DEFAULT_PORT = 8080
-DEFAULT_WATCHDOG_TIMEOUT = 2
-DEFAULT_BATCH_SIZE = 500
-
-
-def _argument_parser():
-    parser = ArgumentParser(
-        description="Start a systemd to elasticsearch journal aggregator"
-    )
-
-    parser.add_argument("--host", default=DEFAULT_HOST, help="Hostname to listen to")
-    parser.add_argument(
-        "--watchdog-timeout",
-        default=DEFAULT_WATCHDOG_TIMEOUT,
-        type=float,
-        help="Interval at which a watchdog should check for old incomplete batches",
-    )
-    parser.add_argument(
-        "--batch-size",
-        default=DEFAULT_BATCH_SIZE,
-        type=int,
-        help="How big does a batch needs to be before being sent",
-    )
-    parser.add_argument(
-        "-p", "--port", default=DEFAULT_PORT, type=int, help="Port to listen to"
-    )
-    parser.add_argument("elastic-url", help="Url to send batched logs to")
-    parser.add_argument("index-name", help="Name of the elasticsearch index")
-    return parser
 
 
 async def parse_field(stream):
@@ -77,16 +51,48 @@ async def parse_entry(stream):
     return fields
 
 
-def message_format(message, index):
-    message_dict = {
-        k.lstrip(b"_").decode("latin1"): int(v) if v.isdigit() else v.decode("latin1")
-        for k, v in message
-    }
+timestamps = {b"__REALTIME_TIMESTAMP", b"__MONOTONIC_TIMESTAMP"}
 
-    message_id = message_dict.pop("CURSOR")
+
+def format_pair(pair):
+    k, v = pair
+    key = k.lstrip(b"_").decode("latin1")
+    if k in timestamps:
+        value = int(v) // 1000
+        return key, value
+
+    value = int(v) if v.isdigit() else v.decode("latin1")
+    return key, value
+
+
+def format_pairs(message):
+    for pair in message:
+        try:
+            yield format_pair(pair)
+        except ValueError:
+            logger.debug("couldn't format %s", pair)
+            continue
+
+
+def message_format(message, index):
+    message_dict = dict(format_pairs(message))
+
+    message_id = message_dict.pop("CURSOR", None)
+    if message_id is None:
+        logger.debug("ignored message because of missing CURSOR: %s", message)
+        return None
+
     message_ser = json.dumps(message_dict)
     message_header = json.dumps({"index": {"_index": index, "_id": message_id}})
     return f"{message_header}\n{message_ser}\n"
+
+
+def format_messages(messages, index_name):
+    for message in messages:
+        formatted = message_format(message, index_name)
+        if formatted is None:
+            continue
+        yield formatted + "\n"
 
 
 @async_generator
@@ -114,10 +120,8 @@ class JournalGateway:
         self.app = web.Application()
         self.app.add_routes(
             [
-                web.post("/gateway/upload", self.upload_journal, name="upload_journal")
-                # TODO: port prometheus_client to aiohttp
-                # https://github.com/prometheus/client_python/blob/master/prometheus_client/twisted/_exposition.py
-                # web.get('/health', self.health, name='health'),
+                web.post("/gateway/upload", self.upload_journal, name="upload_journal"),
+                web.get("/health", prometheus_endpoint(), name="health"),
             ]
         )
 
@@ -132,11 +136,10 @@ class JournalGateway:
             self.client = None
 
     # indefinitely retry
+    @call_counter(journal_send_rounds)
     @backoff.on_exception(backoff.expo, aiohttp.ClientError)
+    @journal_send_exceptions.count_exceptions()
     async def send_batch(self, messages):
-        if not messages:
-            return
-
         payload = "".join(
             message_format(msg, self.index_name) + "\n" for msg in messages
         )
@@ -149,7 +152,10 @@ class JournalGateway:
                 headers=headers,
                 raise_for_status=True,
             ) as response:
-                pass
+                # always read the answer, otherwise the stream
+                # gets in a weird state
+                answer = await response.read()
+                logger.debug("ES answer (code %d): %s", response.status, answer)
         except aiohttp.ClientError:
             logger.exception("posting to ES failed")
             raise
@@ -164,26 +170,14 @@ class JournalGateway:
             self.watchdog = None
 
     async def upload_journal(self, request):
+        upload_start = perf_counter()
         count = 0
+
         async for log in parse_stream(request.content):
             await self.watchdog.insert(log)
             count += 1
+
+        delta = perf_counter() - upload_start
+        http_journal_receive_time.observe(delta)
+        http_journal_receive_entries_count.observe(count)
         return web.Response(text=f"Inserted {count} log items")
-
-
-def main(args=None):
-    if args is None:
-        args = sys.argv[1:]
-
-    options = _argument_parser().parse_args(args=args)
-    gw = JournalGateway(
-        options.watchdog_timeout,
-        options.batch_size,
-        getattr(options, "elastic-url"),
-        getattr(options, "index-name"),
-    )
-    web.run_app(gw.app, host=options.host, port=options.port)
-
-
-if __name__ == "__main__":
-    main()

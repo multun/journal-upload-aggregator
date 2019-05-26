@@ -1,0 +1,71 @@
+#!/usr/bin/python3
+
+import logging
+import sys
+
+from aiohttp import web
+from argparse import ArgumentParser, Namespace
+from journal_upload_aggregator.log import setup_logger, log_level_deduce
+from journal_upload_aggregator.gateway import JournalGateway
+
+
+logger = setup_logger("main")
+
+
+DEFAULT_HOST = "localhost"
+DEFAULT_PORT = 8080
+DEFAULT_WATCHDOG_TIMEOUT = 2
+DEFAULT_BATCH_SIZE = 500
+
+
+def _argument_parser() -> ArgumentParser:
+    parser = ArgumentParser(
+        description="Start a systemd to elasticsearch journal aggregator"
+    )
+
+    parser.add_argument(
+        "-v", "--verbose", action="count", default=0, help="The more v's, the more logs"
+    )
+    parser.add_argument(
+        "-q", "--quiet", action="count", default=0, help="The more q's, the less logs"
+    )
+    parser.add_argument("--host", default=DEFAULT_HOST, help="Hostname to listen to")
+    parser.add_argument(
+        "--watchdog-timeout",
+        default=DEFAULT_WATCHDOG_TIMEOUT,
+        type=float,
+        help="Interval at which a watchdog should check for old incomplete batches",
+    )
+    parser.add_argument(
+        "--batch-size",
+        default=DEFAULT_BATCH_SIZE,
+        type=int,
+        help="How big does a batch needs to be before being sent",
+    )
+    parser.add_argument(
+        "-p", "--port", default=DEFAULT_PORT, type=int, help="Port to listen to"
+    )
+    parser.add_argument("elastic-url", help="Url to send batched logs to")
+    parser.add_argument("index-name", help="Name of the elasticsearch index")
+    return parser
+
+
+def main(args=None) -> None:
+    if args is None:
+        args = sys.argv[1:]
+
+    options: Namespace = _argument_parser().parse_args(args=args)
+    logging.getLogger().setLevel(log_level_deduce(options.verbose, options.quiet))
+
+    gw = JournalGateway(
+        options.watchdog_timeout,
+        options.batch_size,
+        getattr(options, "elastic-url"),
+        getattr(options, "index-name"),
+    )
+
+    web.run_app(gw.app, host=options.host, port=options.port)
+
+
+if __name__ == "__main__":
+    main()
