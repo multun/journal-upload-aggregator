@@ -16,6 +16,7 @@ DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 8080
 DEFAULT_WATCHDOG_TIMEOUT = 2
 DEFAULT_BATCH_SIZE = 500
+DEFAULT_CONCURRENT_BATCHES = 8
 
 
 def _argument_parser() -> ArgumentParser:
@@ -35,6 +36,12 @@ def _argument_parser() -> ArgumentParser:
         default=DEFAULT_WATCHDOG_TIMEOUT,
         type=float,
         help="Interval at which a watchdog should check for old incomplete batches",
+    )
+    parser.add_argument(
+        "--concurrent-batches",
+        default=DEFAULT_CONCURRENT_BATCHES,
+        type=int,
+        help="Maximum number of concurrent uploads to ES",
     )
     parser.add_argument(
         "--batch-size",
@@ -60,6 +67,7 @@ def main(args=None) -> None:
     gw = JournalGateway(
         options.watchdog_timeout,
         options.batch_size,
+        options.concurrent_batches,
         getattr(options, "elastic-url"),
         getattr(options, "index-name"),
     )

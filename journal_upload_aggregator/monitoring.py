@@ -1,4 +1,4 @@
-from prometheus_client import Summary, Counter
+from prometheus_client import Summary, Counter, Gauge
 from functools import wraps
 
 http_journal_receive_time = Summary(
@@ -16,6 +16,8 @@ journal_send_rounds = Counter("journal_send_rounds", "Number of ES upload events
 journal_send_exceptions = Counter(
     "journal_send_exceptions", "Number of ES upload exceptions"
 )
+
+concurrent_uploads = Gauge("concurrent_uploads", "Number of concurrent ES uploads")
 
 
 def call_counter(counter):

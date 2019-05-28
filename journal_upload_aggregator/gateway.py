@@ -7,7 +7,7 @@ import struct
 from time import perf_counter
 
 from aiohttp import web, ClientSession
-from async_generator import async_generator, asynccontextmanager, yield_
+from async_generator import async_generator, yield_
 
 from .watchdog import AsyncBatchWatchdog
 from .log import setup_logger
@@ -110,12 +110,16 @@ class JournalGateway:
         "timeout",
         "batch_size",
         "index_name",
+        "concurrent_batches",
     )
 
-    def __init__(self, timeout, batch_size, target_endpoint, index_name):
+    def __init__(
+        self, timeout, batch_size, concurrent_batches, target_endpoint, index_name
+    ):
         self.index_name = index_name
         self.timeout = timeout
         self.batch_size = batch_size
+        self.concurrent_batches = concurrent_batches
         self.target_endpoint = target_endpoint
         self.app = web.Application()
         self.app.add_routes(
@@ -135,10 +139,10 @@ class JournalGateway:
             await yield_()
             self.client = None
 
-    # indefinitely retry
     @call_counter(journal_send_rounds)
-    @backoff.on_exception(backoff.expo, aiohttp.ClientError)
-    @journal_send_exceptions.count_exceptions()
+    # backoff must be the lowest decorator, as it tests whether
+    # it's wrapped function is coroutine
+    @backoff.on_exception(backoff.constant, aiohttp.ClientError, interval=1, logger=logger)
     async def send_batch(self, messages):
         payload = "".join(
             message_format(msg, self.index_name) + "\n" for msg in messages
@@ -147,23 +151,33 @@ class JournalGateway:
         headers = {"Content-Type": "application/x-ndjson"}
         try:
             async with self.client.post(
-                self.target_endpoint,
-                data=payload.encode("utf-8"),
-                headers=headers,
-                raise_for_status=True,
+                self.target_endpoint, data=payload.encode("utf-8"), headers=headers
             ) as response:
+                answer = await response.read()
+
+                if response.status >= 500:
+                    response.raise_for_status()
+
+                if response.status >= 400:
+                    logger.info(
+                        "invalid ES client request (code %d): %s",
+                        response.status,
+                        answer,
+                    )
+                    response.raise_for_status()
+
                 # always read the answer, otherwise the stream
                 # gets in a weird state
-                answer = await response.read()
                 logger.debug("ES answer (code %d): %s", response.status, answer)
         except aiohttp.ClientError:
+            journal_send_exceptions.inc()
             logger.exception("posting to ES failed")
             raise
 
     @async_generator
     async def watchdog_ctx(self, app):
         async with AsyncBatchWatchdog.context(
-            self.timeout, self.batch_size, self.send_batch
+            self.timeout, self.batch_size, self.send_batch, self.concurrent_batches
         ) as wd:
             self.watchdog = wd
             await yield_()
